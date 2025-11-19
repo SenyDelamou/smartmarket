@@ -1,12 +1,23 @@
 import hashlib
+import sys
 from pathlib import Path
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import mysql.connector
 from mysql.connector import Error
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
+
+# Garantit l'accès au module components, même si Streamlit exécute le script depuis la racine
+_CURRENT_DIR = Path(__file__).resolve().parent
+_CANDIDATE_DIRS = [_CURRENT_DIR, _CURRENT_DIR / "src"]
+for _dir in _CANDIDATE_DIRS:
+    if (_dir / "components").exists() and str(_dir) not in sys.path:
+        sys.path.insert(0, str(_dir))
+        break
 
 from components.animations import inject_animations
 
@@ -249,6 +260,78 @@ def compute_time_series(df: pd.DataFrame, date_col: str, value_col: str, freq="D
     subset = subset.assign(date=pd.to_datetime(subset[date_col]).dt.floor(freq))
     aggregated = subset.groupby("date")[value_col].sum().reset_index().sort_values("date")
     return aggregated
+
+
+# ------------ Helpers spécifiques à l'analyse produits --------------------
+SEUIL_STOCK_BAS = 10
+SEUIL_MARGE_CRITIQUE = 15  # pourcentage
+TOP_N = 10
+
+
+def check_product_data():
+    if "data" not in st.session_state:
+        st.warning("⚠️ Veuillez d'abord importer vos données dans la page Téléversement")
+        return False
+    return True
+
+
+def format_currency(value):
+    try:
+        return f"{int(value):,} GNF"
+    except Exception:
+        return str(value)
+
+
+def normalize_product_columns(df: pd.DataFrame) -> pd.DataFrame:
+    col_map = {
+        "product": "produit",
+        "product_name": "produit",
+        "item": "produit",
+        "name": "produit",
+        "quantity": "quantite",
+        "qty": "quantite",
+        "amount": "quantite",
+        "price": "prix_unitaire",
+        "unit_price": "prix_unitaire",
+        "prix_unitaire": "prix_unitaire",
+        "cost": "cout_unitaire",
+        "cost_unit": "cout_unitaire",
+        "unit_cost": "cout_unitaire",
+        "stock": "stock",
+        "inventory": "stock",
+        "date": "date",
+        "date_vente": "date",
+        "sale_date": "date",
+        "categorie": "categorie",
+        "category": "categorie",
+    }
+    mapping = {}
+    for col in df.columns:
+        key = col.strip().lower().replace(" ", "_")
+        if key in col_map:
+            mapping[col] = col_map[key]
+    if mapping:
+        df = df.rename(columns=mapping)
+    if "date" in df.columns:
+        try:
+            df["date"] = pd.to_datetime(df["date"])
+        except Exception:
+            pass
+    return df
+
+
+def calculate_product_metrics(df: pd.DataFrame):
+    metrics = {}
+    if all(c in df.columns for c in ["quantite", "prix_unitaire"]):
+        metrics["ventes"] = df["quantite"].sum()
+        metrics["ca"] = (df["quantite"] * df["prix_unitaire"]).sum()
+        if "cout_unitaire" in df.columns:
+            metrics["marge"] = ((df["prix_unitaire"] - df["cout_unitaire"]) * df["quantite"]).sum()
+            metrics["taux_marge"] = (metrics["marge"] / metrics["ca"]) * 100 if metrics["ca"] else 0
+    if "stock" in df.columns:
+        metrics["stock_total"] = df["stock"].sum()
+        metrics["produits_stock_bas"] = int(df[df["stock"] < SEUIL_STOCK_BAS].shape[0])
+    return metrics
 
 
 def render_home_page():
@@ -870,24 +953,257 @@ def render_dashboard_page():
 
 
 def render_analytics_page():
-    st.subheader("Analyses avancées")
-    st.image(
-        IMAGES["analytics"],
-        use_container_width=True,
-        caption="Vos analyses personnalisées s'afficheront ici",
-    )
-    st.warning(
-        "📂 Les visualisations analytiques seront générées à partir des jeux de données téléversés. Importez vos fichiers pour activer les filtres et insights contextuels."
-    )
     st.markdown(
         """
-        ### Étapes recommandées
-        1. Téléversez un dataset structuré (ventes, stocks, campagnes…).
-        2. Déclarez les dimensions clés (produit, zone, canal, période) pour la segmentation.
-        3. Configurez vos indicateurs calculés (marge, panier moyen, taux de conversion, etc.).
-        4. Activez les scénarios IA/prédictifs selon vos besoins métier.
-        """
+        <style>
+        .produit-hero {
+            position: relative;
+            margin: -2rem -2rem 2rem -2rem;
+            padding: 3rem 1rem;
+            background: linear-gradient(rgba(0,0,0,0.35), rgba(0,0,0,0.35)), url('https://images.unsplash.com/photo-1581093588401-7f6a199a8dff?auto=format&fit=crop&w=1600&q=80');
+            background-size: cover;
+            background-position: center;
+            color: white;
+            border-radius: 0;
+            text-align: center;
+            min-height: 320px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        .produit-hero h1 {
+            font-size: 2.2rem;
+            margin-bottom: 0.5rem;
+            font-weight: 700;
+            text-shadow: 0 2px 6px rgba(0,0,0,0.35);
+        }
+        .produit-hero p {
+            font-size: 1.15rem;
+            max-width: 700px;
+            margin: 0 auto;
+            line-height: 1.5;
+            opacity: 0.95;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
+
+    st.markdown(
+        """
+        <section class="produit-hero">
+            <h1>Analyse Produit</h1>
+            <p>Explorez les performances de vos produits, identifiez les tendances et optimisez votre assortiment.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not check_product_data():
+        return
+
+    df = normalize_product_columns(st.session_state["data"].copy())
+    if "produit" not in df.columns:
+        st.error("La colonne 'produit' est introuvable dans votre dataset.")
+        st.info(f"Colonnes disponibles : {', '.join(df.columns)}")
+        st.stop()
+
+    with st.sidebar:
+        st.header("🎯 Paramètres d'analyse")
+        st.subheader("📅 Période")
+        if "date" in df.columns:
+            min_date = pd.to_datetime(df["date"]).min()
+            max_date = pd.to_datetime(df["date"]).max()
+            date_range = st.date_input(
+                "Sélectionner la période",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+            )
+            if len(date_range) == 2:
+                df = df[(df["date"] >= pd.Timestamp(date_range[0])) & (df["date"] <= pd.Timestamp(date_range[1]))]
+
+        st.subheader("🏷️ Filtres")
+        if "categorie" in df.columns:
+            categories = ["Tous"] + sorted(df["categorie"].dropna().unique().tolist())
+            selected_cat = st.selectbox("Catégorie", categories)
+            if selected_cat != "Tous":
+                df = df[df["categorie"] == selected_cat]
+
+        if "produit" in df.columns:
+            products = sorted(df["produit"].dropna().unique().tolist())
+            selected_products = st.multiselect("Produits spécifiques", products)
+            if selected_products:
+                df = df[df["produit"].isin(selected_products)]
+
+    metrics = calculate_product_metrics(df)
+
+    st.header("📊 Tableau de Bord")
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        st.metric("Produits Actifs", f"{df['produit'].nunique():,}", help="Nombre total de produits différents vendus")
+    with kpi2:
+        st.metric("Ventes Totales", format_currency(metrics.get("ca", 0)), help="Chiffre d'affaires total")
+    with kpi3:
+        marge = metrics.get("marge", 0)
+        taux_marge = metrics.get("taux_marge", 0)
+        st.metric("Marge Brute", format_currency(marge), f"{taux_marge:.1f}%", help="Marge brute et taux de marge")
+    with kpi4:
+        st.metric(
+            "Alerte Stock",
+            f"{metrics.get('produits_stock_bas', 0)} produits",
+            help=f"Produits avec stock < {SEUIL_STOCK_BAS} unités",
+        )
+
+    st.header("📈 Analyses Détaillées")
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Performance Produits", "💰 Rentabilité", "📦 Gestion Stock", "🔄 Tendances"])
+
+    with tab1:
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            if "produit" in df.columns and all(c in df.columns for c in ["quantite", "prix_unitaire"]):
+                ca_by_product = (
+                    df.groupby("produit")
+                    .apply(lambda x: (x["quantite"] * x["prix_unitaire"]).sum())
+                    .sort_values(ascending=False)
+                    .head(TOP_N)
+                )
+                fig = px.bar(
+                    ca_by_product,
+                    title=f"Top {TOP_N} Produits par Chiffre d'Affaires",
+                    labels={"value": "CA (GNF)", "produit": "Produit"},
+                    template="plotly_white",
+                )
+                fig.update_layout(showlegend=False, height=400)
+                st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            st.subheader("🏆 Top Performers")
+            top_products = (
+                df.groupby("produit")
+                .agg({"quantite": "sum", "prix_unitaire": "mean"})
+                .sort_values("quantite", ascending=False)
+                .head(5)
+            )
+            st.dataframe(
+                top_products.style.format({"quantite": "{:,.0f}", "prix_unitaire": "{:,.0f} GNF"}),
+                height=400,
+            )
+
+    with tab2:
+        if all(c in df.columns for c in ["quantite", "prix_unitaire", "cout_unitaire"]):
+            df["marge"] = (df["prix_unitaire"] - df["cout_unitaire"]) * df["quantite"]
+            rentabilite = (
+                df.groupby("produit")
+                .agg({"marge": "sum", "quantite": "sum"})
+                .reset_index()
+            )
+            fig = px.scatter(
+                rentabilite,
+                x="quantite",
+                y="marge",
+                size="marge",
+                color="marge",
+                hover_name="produit",
+                title="💰 Rentabilité par Produit",
+                labels={"marge": "Marge Totale (GNF)", "quantite": "Quantité Vendue"},
+                template="plotly_white",
+            )
+            fig.update_traces(marker=dict(sizemode="diameter", opacity=0.8))
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Ajoutez les colonnes 'prix_unitaire', 'quantite' et 'cout_unitaire' pour analyser la rentabilité.")
+
+    with tab3:
+        if "stock" in df.columns:
+            stock = df.groupby("produit").agg({"stock": "sum", "quantite": "sum"}).reset_index()
+            fig = px.bar(
+                stock,
+                x="produit",
+                y="stock",
+                title="📦 Niveau de Stock par Produit",
+                labels={"stock": "Stock Actuel", "produit": "Produit"},
+                template="plotly_white",
+            )
+            fig.update_layout(showlegend=False, height=400, xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Ajoutez la colonne 'stock' pour suivre les niveaux de stock.")
+
+    with tab4:
+        if "date" in df.columns and "quantite" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            ventes = (
+                df.groupby(df["date"].dt.to_period("M"))
+                .agg({"quantite": "sum", "prix_unitaire": "mean"})
+                .reset_index()
+            )
+            ventes["date"] = ventes["date"].dt.to_timestamp()
+            fig = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.1,
+                subplot_titles=("Ventes Mensuelles", "Prix Unitaire Moyen Mensuel"),
+            )
+            fig.add_trace(go.Bar(x=ventes["date"], y=ventes["quantite"], name="Ventes"), row=1, col=1)
+            fig.add_trace(
+                go.Scatter(x=ventes["date"], y=ventes["prix_unitaire"], name="Prix Unitaire", mode="lines+markers"),
+                row=2,
+                col=1,
+            )
+            fig.update_layout(height=600, title_text="📈 Tendances des Ventes et Prix dans le Temps", template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Ajoutez les colonnes 'date' et 'quantite' pour visualiser les tendances.")
+
+    st.header("📥 Export et Rapports")
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        report_type = st.selectbox("Type de rapport", ["Rapport complet", "Synthèse performance", "Analyse stock"])
+    with col2:
+        if st.button("📥 Générer le rapport", use_container_width=True):
+            products = sorted(df["produit"].dropna().unique().tolist())
+
+            def sum_qty(grp):
+                return grp["quantite"].fillna(0).sum() if "quantite" in grp.columns else 0
+
+            def sum_ca(grp):
+                if "quantite" in grp.columns and "prix_unitaire" in grp.columns:
+                    return (grp["quantite"].fillna(0) * grp["prix_unitaire"].fillna(0)).sum()
+                return 0
+
+            def sum_margin(grp):
+                if all(c in grp.columns for c in ("quantite", "prix_unitaire", "cout_unitaire")):
+                    return ((grp["prix_unitaire"].fillna(0) - grp["cout_unitaire"].fillna(0)) * grp["quantite"].fillna(0)).sum()
+                return 0
+
+            def sum_stock(grp):
+                return grp["stock"].fillna(0).sum() if "stock" in grp.columns else 0
+
+            rows = []
+            for produit in products:
+                grp = df[df["produit"] == produit]
+                rows.append(
+                    {
+                        "Produit": produit,
+                        "Ventes_Totales": sum_qty(grp),
+                        "CA_Total": sum_ca(grp),
+                        "Marge_Totale": sum_margin(grp),
+                        "Stock_Actuel": sum_stock(grp),
+                        "Date_Export": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
+                )
+
+            output = pd.DataFrame(rows)
+            csv = output.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "💾 Télécharger le rapport",
+                csv,
+                f"analyse_produits_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                "text/csv",
+            )
 
 
 def render_upload_page():
