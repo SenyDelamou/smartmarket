@@ -1,0 +1,16 @@
+ streamlit 
+pandas
+ numpy
+ seaborn
+ matplotlib 
+scikit-learn 
+xgboost
+ joblib
+ openpyxl 
+xlrd
+ plotly
+ mysql-connector-python
+ holidays
+ pytrends 
+requests
+prophet
